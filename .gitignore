@@ -1,2 +1,5 @@
 informe/
 proxy.py
+.vscode/
+__pycache__/
+c1p1/
