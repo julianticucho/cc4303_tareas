@@ -15,7 +15,10 @@ class SocketTCP:
         self.timeout = 2
         self.debug = False
         self.message_length = 0
+        # bytes que faltan por llegar desde la red
         self.pending = 0
+        # bytes que ya se descargaron en la red, pero que el 
+        # usuario no ha pedido retirar
         self.buffer = b""
     
     @staticmethod
@@ -58,19 +61,25 @@ class SocketTCP:
             mark = " [reenvío]" if resend else ""
             print(f"[DEBUG] Enviando {'+'.join(types)} seq={seq} ({len(data)} bytes){mark}", file=sys.stderr)
 
+    # el servidor asocia el socket UDP interno con una dirección
+    # ip y un puerto específicos, guardamos la dirección asignada
+    # para saber exactamente en que puerto quedó escuchando el socket
     def bind(self, address):
         self.udp_socket.bind(address)
         self.local_addr = self.udp_socket.getsockname()
         if self.debug:
             print(f"[DEBUG] bind en {self.local_addr}", file=sys.stderr)
     
-    # lado del cliente
+    # como cliente establecemos la conexión usando Three-Way Handshake,
+    # para esto enviamos un SYN con un seq=x aleatorio y esperamos una 
+    # respuesta SYN+ACK, si se cumple el timeout y no ha llegado, volvemos
+    # a enviar el SYN con seq=x, si llega cualquier otra cosa que no sea un
+    # un SYN+ACK, lo descartamos y continuamos esperando el SYN+ACK,
+    # finalmente enviamos el ACK final con el seq que llegó + 1
     def connect(self, address):
-        # (1) elegir un seq aleatorio  
         self.dest_addr = address
         self.seq = random.randint(0, 100)
-
-        # (2) enviar el SYN y esperar el SYN+ACK, si hay timeout, retransmitir
+        
         self.udp_socket.settimeout(self.timeout)
         synack_ok = False
         resend = False
@@ -85,21 +94,25 @@ class SocketTCP:
                             print(f"[DEBUG] connect: recibí SYN+ACK seq={parsed["seq"]} desde {addr}", file=sys.stderr)
                         synack_ok = True
             except socket.timeout:
-                # no llegó el SYN+ACK, retransmitir el SYN
                 if self.debug:
                     print(f"[DEBUG] connect: timeout, retransmito SYN seq={self.seq}", file=sys.stderr)
                 resend = True
         
-        # (3) enviar un ACK final
         self.dest_addr = addr
         self.seq = parsed["seq"] + 1
         self._send_segment(False, True, False, self.seq)
         self.seq += 1
         self.udp_socket.settimeout(None)
 
-    # lado del servidor
+    # como servidor establemos la conexión usando Three-Way Handshake,
+    # aqui tenemos que esperar el SYN que nos envió el cliente, si nos 
+    # llega cualquier otra cosa seguimos esperando, luego creamos un
+    # nuevo socket dedicado a la conexión, y lo usamos para enviar un
+    # SYN+ACK con el seq recibido + 1 al cliente, y esperar una respuesta
+    # ACK con el número de secuencia aumentado en 1, esta parte es
+    # análoga al enviar/esperar con timeout del connect(), finalmente
+    # actualizamos el número de seq y retornamos el socket dedicado
     def accept(self):
-        # (1) espera hasta que llege un SYN
         while True:
             segment, addr = self.udp_socket.recvfrom(HEADER_SIZE + MAX_DATA)
             parsed = self.parse_segment(segment)
@@ -108,16 +121,13 @@ class SocketTCP:
         if self.debug:
             print(f"[DEBUG] accept: recibí SYN seq={parsed["seq"]} de {addr}", file=sys.stderr)
         
-        # (2) crear un socket nuevo de la conexión
         conn = SocketTCP()
         conn.debug = self.debug
         conn.udp_socket.bind((self.local_addr[0], 0))
         conn.local_addr = conn.udp_socket.getsockname()
         conn.dest_addr = addr
         conn.seq = parsed["seq"] + 1
-
-        # (3) enviar un SYN+ACK        
-        # (4) esperar el ACK final
+        
         conn.udp_socket.settimeout(self.timeout)
         ack_ok = False
         resend = False
@@ -132,7 +142,6 @@ class SocketTCP:
                             print(f"[DEBUG] accept: recibí ACK seq={parsed2['seq']}, handshake completo", file=sys.stderr)
                         ack_ok = True
             except socket.timeout:
-                # no llegó el ACK, retransmitir el SYN+ACK
                 if self.debug:
                     print(f"[DEBUG] accept: timeout, retransmito SYN+ACK seq={conn.seq}", file=sys.stderr)
                 resend = True
@@ -141,14 +150,16 @@ class SocketTCP:
         conn.seq = parsed2["seq"] + 1
         return conn, conn.local_addr
     
-    # lado del emisor: stop and wait
+    # como emisor, primero enviaremos el largo del mensaje en 4 bytes, y luego 
+    # el mensaje en segmentos de 16 bytes, por cada segmento, lo enviamos y esperamos
+    # una respuesta ACK del receptor, con número de secuencia aumentado en el largo 
+    # del paquete, y con un timeout, esta parte se programa análoga a la parte anterior,
+    # finalmente se actualiza el número de seq y se pasa al siguiente segmento 
     def send(self, message):
-        # (1) primer segmento con el largo del mensaje, luego trozos de 16 bytes
         parts = [len(message).to_bytes(4, "big")]
         for i in range(0, len(message), MAX_DATA):
             parts.append(message[i:i+MAX_DATA])
 
-        # (2) enviar cada parte y esperar su ACK antes de pasar a la siguiente
         self.udp_socket.settimeout(self.timeout)
         for part in parts:
             seq_segment = self.seq
@@ -158,40 +169,41 @@ class SocketTCP:
             while not ack_ok:
                 self._send_segment(False, False, False, seq_segment, part, resend=resend)
                 try:
-                    # esperar hasta recibir un ACK con el seq que corresponde
                     while not ack_ok:
                         raw, _ = self.udp_socket.recvfrom(HEADER_SIZE + MAX_DATA)
                         parsed = self.parse_segment(raw)
-                        
                         # caso borde: se perdió el último ACK del handshake,
-                        # el servidor reenvía el SYN+ACK; hay que reenviar ese ACK
+                        # el servidor reenvía el SYN+ACK, hay que reenviar ese ACK
                         if parsed["syn"] and parsed["ack"]:
                             if self.debug:
                                 print(f"[DEBUG] send: SYN+ACK duplicado del handshake, reenvío ACK seq={parsed['seq'] + 1}", file=sys.stderr)
                             self._send_segment(False, True, False, parsed["seq"] + 1)
                             continue
-                        
                         if parsed["ack"] and parsed["seq"] == esperado:
                             ack_ok = True
-                        
                 except socket.timeout:
-                    # si no llego el ACK a tiempo, retransmitir el mismo segmento
                     if self.debug:
                         print(f"[DEBUG] send: timeout esperando ACK de seq={seq_segment}, retransmito", file=sys.stderr)
                     resend = True
             self.seq = esperado
+        
         self.udp_socket.settimeout(None)
         if self.debug:
             print(f"[DEBUG] send: mensaje de {len(message)} bytes entregado", file=sys.stderr)
 
-    # lado del receptor: stop and wait
+    # como receptor, primero esperamos al segmento que trae el largo del mensaje, 
+    # luego calculamos cuandos bytes debemos entregar segun el límite solicitado
+    # por el usuario, luego seguimos recibiendo segmentos hasta acumular
+    # la cantidad necesaria, luego retornamos los datos solicitados cortando 
+    # el buffer hasta el tamaño objetivo y conservamos los restantes para futuras
+    # llamadas, finalmente si ya se entregaron todos los bytes del mensaje,
+    # dejamos todo listo para el próximo mensaje
     def recv(self, buff_size):
-        # (1) si no hay mensaje en curso, esperar el segmento que trae el largo
         if self.message_length == 0:
             while True:
                 raw, _ = self.udp_socket.recvfrom(HEADER_SIZE + MAX_DATA)
                 parsed = self.parse_segment(raw)
-                # si seq es distinto al esperado es un duplicado, reenviar el ACK y ignorar
+                # si seq es distinto al esperado, reenviar el ACK y ignorar
                 if parsed["seq"] != self.seq or not parsed["data"]:
                     self._send_segment(False, True, False, self.seq)
                     if self.debug:
@@ -205,14 +217,12 @@ class SocketTCP:
                     print(f"[DEBUG] recv: largo del mensaje = {self.message_length}", file=sys.stderr)
                 break
         
-        # (2) cuánto falta entregar de este mensaje, sin pasar buff_size
+        # cuánto falta entregar de este mensaje, sin pasar buff_size
         target = min(self.pending + len(self.buffer), buff_size)
-
-        # (3) recibir segmentos y acumular hasta llegar a la meta
         while len(self.buffer) < target:
             raw, _ = self.udp_socket.recvfrom(HEADER_SIZE + MAX_DATA)
             parsed = self.parse_segment(raw)
-            # duplicado: solo reenviar el ACK, los datos ya se entregaron
+            # duplicado, solo reenviar el ACK, los datos ya se entregaron
             if parsed["seq"] != self.seq or not parsed["data"]:
                 self._send_segment(False, True, False, self.seq)
                 if self.debug:
@@ -225,21 +235,21 @@ class SocketTCP:
             if self.debug:
                 print(f"[DEBUG] recv: seq={parsed['seq']} ({len(parsed['data'])} bytes)", file=sys.stderr)
 
-        # (4) entregar a lo sumo buff_size bytes
         result = self.buffer[:target]
         self.buffer = self.buffer[target:]
-
-        # (5) si se entregó todo el mensaje, dejar el estado listo para el próximo
         if self.pending == 0 and len(self.buffer) == 0:
             self.message_length = 0
-
         if self.debug:
             print(f"[DEBUG] recv: entregando {len(result)} bytes", file=sys.stderr)
         return result
     
-    # lado del emisor: cierre de conexión
+    # como emisor, si queremos cerrar la conexión tenemos que enviar 
+    # un FIN y esperar un FIN+ACK con seq aumentado en 1, esto lo 
+    # hacemos análogamente a las otras funciones, pero poniendo un 
+    # límite de 3 reintentos, luego con FIN+ACK recibido, reenviamos el
+    # último ACK 3 veces seguidas, por si el último paquete se pierde
+    # en el camino
     def close(self):
-        # (1) enviar el FIN y esperar el FIN+ACK seq=z+1, hasta 3 timeouts
         timeouts = 0
         finack_ok = False
         resend = False
@@ -255,14 +265,11 @@ class SocketTCP:
                             print(f"[DEBUG] close: recibí FIN+ACK seq={parsed['seq']}", file=sys.stderr)
                         finack_ok = True
             except socket.timeout:
-                # no llegó el FIN+ACK, reenviar el mismo FIN
                 timeouts += 1
                 if self.debug:
                     print(f"[DEBUG] close: timeout {timeouts}/3 esperando FIN+ACK, reenvío FIN", file=sys.stderr)
                 resend = True
 
-        # (2) con FIN+ACK recibido, reenviar el último ACK 3 veces, 
-        # esperando un timeout entre envíos
         if finack_ok:
             self.seq = parsed["seq"] + 1
             for i in range(3):
@@ -271,16 +278,17 @@ class SocketTCP:
                 self._send_segment(False, True, False, self.seq, resend=(i > 0))
             self.seq += 1
         else:
-            # 3er timeout: asumo que la contraparte se cerró
             if self.debug:
                 print("[DEBUG] close: 3 timeouts sin FIN+ACK, asumo que la contraparte cerró", file=sys.stderr)
 
-        # (3) liberar el socket UDP
         self.udp_socket.close()
 
-    # lado del receptor: continúa el cierre de conexión
+    # como receptor, esperamos el FIN que mandó el emisor, si 
+    # acumula 3 timeouts sin ver el FIN, asumimos que la contraparte
+    # murió, cerrando el socket, luego de recibir el FIN, respondemos
+    # con un FIN+ACK con seq + 1, y esperamos un ACK con seq + 2, esto
+    # lo programamos análogamente a las otras funciones
     def recv_close(self):
-        # (1) esperar el FIN seq=z, hasta 3 timeouts
         timeouts = 0
         fin_ok = False
         self.udp_socket.settimeout(self.timeout)
@@ -306,17 +314,13 @@ class SocketTCP:
                     print(f"[DEBUG] recv_close: timeout {timeouts}/3 esperando FIN", file=sys.stderr)
 
         if not fin_ok:
-            # 3er timeout: asumo que la contraparte se cerró
             if self.debug:
                 print("[DEBUG] recv_close: 3 timeouts sin FIN, asumo que la contraparte cerró", file=sys.stderr)
             self.udp_socket.close()
             return
 
-        # (2) responder con un FIN+ACK seq=z+1
         self.seq = parsed["seq"] + 1
         self._send_segment(False, True, True, self.seq)
-
-        # (3) esperar el ACK final seq=z+2
         timeouts = 0
         ack_ok = False
         while not ack_ok and timeouts < 3:
@@ -343,10 +347,8 @@ class SocketTCP:
                     print(f"[DEBUG] recv_close: timeout {timeouts}/3 esperando el ACK final", file=sys.stderr)
 
         if not ack_ok:
-            # 3er timeout: asumo que la contraparte se cerró
             if self.debug:
                 print("[DEBUG] recv_close: 3 timeouts sin ACK final, asumo que la contraparte cerró", file=sys.stderr)
 
-        # (4) liberar el socket UDP
         self.seq = parsed2["seq"] + 1
         self.udp_socket.close()
