@@ -1,2 +1,0 @@
-# Router default: no conoce rutas especificas, todo lo que reciba aca
-# viene de un router de la red y se descarta si no matchea nada
